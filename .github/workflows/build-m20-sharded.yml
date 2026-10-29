@@ -1,0 +1,220 @@
+name: m20lte sharded build (one task, three runners)
+
+# Same artifact as build-m20.yml, but one build is split across the whole
+# pool: three shard jobs compile disjoint slices of the tree in parallel, a
+# fourth job links, packages and uploads.
+#
+# The link job runs the full `make Image dtbs modules` anyway, so a shard that
+# is too small only costs time (the merge compiles the remainder) — it can
+# never produce a wrong artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Variant to build
+        required: true
+        default: vanilla
+        type: choice
+        options: [vanilla, apatch, ksu-next]
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  PLATFORM_VERSION: "11"
+  ANDROID_MAJOR_VERSION: r
+
+jobs:
+  shard:
+    name: Shard ${{ matrix.shard }}/3
+    runs-on: [self-hosted, m20lte]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libncurses-dev \
+            ccache zip unzip cpio device-tree-compiler lzop libtinfo6 \
+            gcc make python3 curl || true
+
+      - name: Prepare variant
+        run: |
+          set -e
+          case "${{ inputs.variant }}" in
+            apatch)
+              patch -p1 < patches/apatch.patch
+              echo "DEFCONFIG=exynos7885-m20_apatch_defconfig" >> $GITHUB_ENV
+              ;;
+            ksu-next)
+              patch -p1 < patches/ksu.patch
+              git clone --depth=1 --branch legacy https://github.com/KernelSU-Next/KernelSU-Next.git
+              ln -sf ../KernelSU-Next/kernel drivers/kernelsu
+              if [ -f ksu-patches/0001-sepolicy-exynos-flex-array.patch ]; then
+                (cd KernelSU-Next && patch -p1 -N < ../ksu-patches/0001-sepolicy-exynos-flex-array.patch || true)
+              fi
+              echo "DEFCONFIG=exynos7885-m20_ksu_next_defconfig" >> $GITHUB_ENV
+              ;;
+            *)
+              echo "DEFCONFIG=exynos7885-m20_gsi_defconfig" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Configure
+        run: |
+          set -e
+          chmod +x prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/* || true
+          export CROSS_COMPILE=$PWD/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          make ARCH=arm64 "$DEFCONFIG"
+          # Generated headers/tools are needed before any subtree target.
+          make ARCH=arm64 -j"$(nproc)" prepare
+
+      - name: Compile shard
+        run: |
+          set -e
+          export CROSS_COMPILE=$PWD/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          case "${{ matrix.shard }}" in
+            0) TARGETS="drivers/media/ drivers/gpu/ drivers/staging/ drivers/misc/
+                        drivers/char/ drivers/video/ drivers/iommu/ drivers/hwtracing/" ;;
+            1) TARGETS="drivers/clk/ drivers/mmc/ drivers/net/ drivers/usb/ drivers/scsi/
+                        drivers/mtd/ drivers/pci/ drivers/dma/ drivers/gpio/ drivers/pinctrl/
+                        drivers/regulator/ drivers/spi/ drivers/i2c/ drivers/input/
+                        drivers/thermal/ drivers/rtc/ drivers/watchdog/ drivers/power/
+                        drivers/soc/ drivers/mfd/ drivers/irqchip/ drivers/leds/
+                        drivers/memory/ drivers/phy/ drivers/tty/ drivers/firmware/
+                        drivers/clocksource/ drivers/hwmon/ drivers/extcon/ drivers/mailbox/
+                        drivers/reset/ drivers/pwm/ drivers/base/ drivers/of/ drivers/acpi/
+                        drivers/ata/ drivers/block/ drivers/bluetooth/ drivers/cpufreq/
+                        drivers/cpuidle/ drivers/crypto/ drivers/devfreq/ drivers/edac/
+                        drivers/nfc/ drivers/pnp/ drivers/ras/ drivers/slimbus/ drivers/tee/
+                        drivers/ufs/ drivers/vme/ drivers/dma-buf/ drivers/remoteproc/
+                        drivers/rpmsg/ drivers/sh/ drivers/virtio/" ;;
+            *) TARGETS="sound/ net/ fs/ arch/arm64/ kernel/ mm/ lib/ crypto/ security/
+                        block/ ipc/ init/ virt/ usr/ certs/ drivers/android/
+                        drivers/platform/ drivers/vhost/ drivers/uio/" ;;
+          esac
+
+          # Only pass targets that exist in this tree.
+          present=""
+          for t in $TARGETS; do [ -d "$t" ] && present="$present $t"; done
+          echo "Shard ${{ matrix.shard }} targets:$present"
+          make ARCH=arm64 -j"$(nproc)" $present 2>&1 | tail -40
+
+      - name: Pack object files
+        run: |
+          set -e
+          # .cmd files carry the exact compiler flags; without them kbuild in
+          # the merge job would rebuild everything from scratch.
+          find . -path ./out -prune -o \
+               \( -name '*.o' -o -name '*.a' -o -name '*.o.cmd' -o -name '*.a.cmd' \
+                  -o -name 'modules.order' -o -name 'Module.symvers' \) -print \
+            | tar -czf "/tmp/shard-${{ matrix.shard }}.tgz" -T -
+          du -h "/tmp/shard-${{ matrix.shard }}.tgz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: objs-shard-${{ matrix.shard }}
+          path: /tmp/shard-${{ matrix.shard }}.tgz
+          retention-days: 1
+
+  link:
+    name: Link + package
+    needs: shard
+    runs-on: [self-hosted, m20lte]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libncurses-dev \
+            ccache zip unzip cpio device-tree-compiler lzop libtinfo6 \
+            gcc make python3 curl || true
+
+      - name: Prepare variant
+        run: |
+          set -e
+          case "${{ inputs.variant }}" in
+            apatch)
+              patch -p1 < patches/apatch.patch
+              echo "DEFCONFIG=exynos7885-m20_apatch_defconfig" >> $GITHUB_ENV
+              echo "EDITION=Onyx-APatch" >> $GITHUB_ENV
+              echo "ZIP_NAME=Pox-Kernel-1.0.0-Beta-Onyx-APatch-m20lte.zip" >> $GITHUB_ENV
+              ;;
+            ksu-next)
+              patch -p1 < patches/ksu.patch
+              git clone --depth=1 --branch legacy https://github.com/KernelSU-Next/KernelSU-Next.git
+              ln -sf ../KernelSU-Next/kernel drivers/kernelsu
+              if [ -f ksu-patches/0001-sepolicy-exynos-flex-array.patch ]; then
+                (cd KernelSU-Next && patch -p1 -N < ../ksu-patches/0001-sepolicy-exynos-flex-array.patch || true)
+              fi
+              echo "DEFCONFIG=exynos7885-m20_ksu_next_defconfig" >> $GITHUB_ENV
+              echo "EDITION=Onyx-KSUN" >> $GITHUB_ENV
+              echo "ZIP_NAME=Pox-Kernel-1.0.0-Beta-Onyx-KSUN-m20lte.zip" >> $GITHUB_ENV
+              ;;
+            *)
+              echo "DEFCONFIG=exynos7885-m20_gsi_defconfig" >> $GITHUB_ENV
+              echo "EDITION=Onyx" >> $GITHUB_ENV
+              echo "ZIP_NAME=Pox-Kernel-1.0.0-Beta-Onyx-m20lte.zip" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Collect shard objects
+        uses: actions/download-artifact@v4
+        with:
+          pattern: objs-shard-*
+          merge-multiple: true
+          path: /tmp/shards
+
+      - name: Unpack shards
+        run: |
+          set -e
+          for f in /tmp/shards/*.tgz; do
+            echo "unpacking $f"
+            tar -xzf "$f" -C .
+          done
+          echo "object files present: $(find . -name '*.o' | wc -l)"
+
+      - name: Finish build
+        run: |
+          set -e
+          chmod +x prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/* || true
+          export CROSS_COMPILE=$PWD/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+          make ARCH=arm64 "$DEFCONFIG"
+          mkdir -p out
+          make ARCH=arm64 -j"$(nproc)" Image dtbs modules 2>&1 | tee out/build.log
+          ls -lh arch/arm64/boot/Image
+
+      - name: Package AnyKernel3
+        run: |
+          set -e
+          chmod +x tools/package_ak3.sh
+          bash tools/package_ak3.sh "${{ inputs.variant }}" "$EDITION" "$ZIP_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pox-Kernel-1.0.0-Beta-${{ env.EDITION }}-m20lte-AnyKernel3
+          path: dist/${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-outputs-${{ inputs.variant }}-m20lte-sharded
+          path: |
+            dist/Image-m20lte
+            dist/build.log
+            dist/defconfig_used
+          if-no-files-found: warn
